@@ -1,0 +1,114 @@
+blueprint:
+  name: EV Charger Dynamic Current Control
+  description: >
+    Dynamically adjusts EV charger current to keep net grid power near a target.
+    Supports custom allowed current steps, charger entity, power meter entity,
+    tolerance, and target power.
+  domain: automation
+  input:
+    charger_entity:
+      name: Charger current entity
+      selector:
+        entity:
+          domain: number
+
+    power_meter_entity:
+      name: Power meter entity
+      selector:
+        entity:
+          domain: sensor
+
+    supported_current_settings:
+      name: Supported current settings
+      description: Comma-separated list of allowed charging currents, e.g. 6,8,10,13,16
+      default: "6,8,10,13,16"
+      selector:
+        text: {}
+
+    target_power:
+      name: Target power
+      description: Desired net grid power in watts.
+      default: 6000
+      selector:
+        number:
+          min: -50000
+          max: 50000
+          step: 100
+          unit_of_measurement: W
+          mode: box
+
+    tolerance:
+      name: Tolerance
+      description: Allowed deviation from target power in watts.
+      default: 300
+      selector:
+        number:
+          min: 0
+          max: 10000
+          step: 50
+          unit_of_measurement: W
+          mode: box
+
+mode: single
+
+trigger:
+  - platform: time_pattern
+    minutes: "/1"
+
+variables:
+  charger_entity: !input charger_entity
+  power_meter_entity: !input power_meter_entity
+  target_power: !input target_power
+  tolerance: !input tolerance
+  supported_current_settings_raw: !input supported_current_settings
+
+  valid_amps: >
+    {{ supported_current_settings_raw
+       .split(',')
+       | map('trim')
+       | reject('eq', '')
+       | map('int')
+       | unique
+       | list
+       | sort }}
+
+  grid_power: "{{ states(power_meter_entity) | float(0) }}"
+  current_amp: "{{ states(charger_entity) | int(0) }}"
+
+  should_increase: "{{ grid_power < (target_power - tolerance) }}"
+  should_decrease: "{{ grid_power > (target_power + tolerance) }}"
+
+  next_up: >
+    {% set v = valid_amps %}
+    {% set c = current_amp %}
+    {% set up = v | select('gt', c) | list %}
+    {{ up[0] if up | length > 0 else c }}
+
+  next_down: >
+    {% set v = valid_amps %}
+    {% set c = current_amp %}
+    {% set down = v | select('lt', c) | list %}
+    {{ down[-1] if down | length > 0 else c }}
+
+  new_amp: >
+    {% if should_increase %}
+      {{ next_up | int }}
+    {% elif should_decrease %}
+      {{ next_down | int }}
+    {% else %}
+      {{ current_amp | int }}
+    {% endif %}
+
+  delta_amp: "{{ (new_amp | int) - (current_amp | int) }}"
+
+action:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ valid_amps | length > 0 and delta_amp != 0 }}"
+        sequence:
+          - service: number.set_value
+            target:
+              entity_id: !input charger_entity
+            data:
+              value: "{{ new_amp | int }}"
