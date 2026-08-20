@@ -8,6 +8,15 @@ blueprint:
     Block values are entered in watts.
     The block value is treated as a hard upper limit.
     Tolerance is only used when deciding whether it is safe to increase current.
+
+    Step power is calculated assuming a 3-phase 230 V connection (690 W per amp).
+    Increases only happen when the extra power of the next step still fits under
+    the block limit minus the tolerance. When over the limit, the current can
+    jump down several steps at once to get back under it quickly.
+
+    Fail-safe: while the power meter or time block entity is unavailable or
+    non-numeric, the charger is set to the lowest allowed current. Normal
+    control resumes automatically when the data comes back.
   domain: automation
   input:
     charger_entity:
@@ -41,8 +50,8 @@ blueprint:
       name: Increase tolerance
       description: >
         Safety margin in watts used only before increasing charging current.
-        Charging current will only increase if measured power is at least this
-        much below the block limit.
+        Charging current will only increase if measured power plus the power
+        added by the next step stays at least this much below the block limit.
       default: 300
       selector:
         number:
@@ -113,10 +122,13 @@ blueprint:
           mode: box
 
 mode: single
+max_exceeded: silent
 
 trigger:
   - platform: time_pattern
     minutes: "/1"
+  - platform: state
+    entity_id: !input time_block_entity
 
 variables:
   charger_entity: !input charger_entity
@@ -131,56 +143,72 @@ variables:
   agreed_power_block_4: !input agreed_power_block_4
   agreed_power_block_5: !input agreed_power_block_5
 
+  # Assumes a 3-phase 230 V connection: 3 x 230 V = 690 W per amp.
+  watts_per_amp: 690
+
   valid_amps: >
     {{ supported_current_settings_raw
        .split(',')
        | map('trim')
        | reject('eq', '')
-       | map('int')
+       | map('int', 0)
+       | select('gt', 0)
        | unique
        | list
        | sort }}
 
   grid_power: "{{ states(power_meter_entity) | float(0) }}"
-  current_amp: "{{ states(charger_entity) | int(0) }}"
+  current_amp: "{{ states(charger_entity) | float(0) | round(0) | int }}"
   current_block: "{{ states(time_block_entity) | int(0) }}"
 
+  data_ok: >
+    {{ is_number(states(power_meter_entity))
+       and current_block in [1, 2, 3, 4, 5] }}
+
   block_limit_w: >
-    {% if current_block == 1 %}
-      {{ agreed_power_block_1 | float(0) }}
-    {% elif current_block == 2 %}
-      {{ agreed_power_block_2 | float(0) }}
-    {% elif current_block == 3 %}
-      {{ agreed_power_block_3 | float(0) }}
-    {% elif current_block == 4 %}
-      {{ agreed_power_block_4 | float(0) }}
-    {% elif current_block == 5 %}
-      {{ agreed_power_block_5 | float(0) }}
+    {% if current_block in [1, 2, 3, 4, 5] %}
+      {{ [0,
+          agreed_power_block_1,
+          agreed_power_block_2,
+          agreed_power_block_3,
+          agreed_power_block_4,
+          agreed_power_block_5][current_block] | float(0) }}
     {% else %}
       0
     {% endif %}
 
   next_up: >
-    {% set v = valid_amps %}
-    {% set c = current_amp %}
-    {% set up = v | select('gt', c) | list %}
-    {{ up[0] if up | length > 0 else c }}
+    {% set up = valid_amps | select('gt', current_amp) | list %}
+    {{ up[0] if up | length > 0 else current_amp }}
 
-  next_down: >
-    {% set v = valid_amps %}
-    {% set c = current_amp %}
-    {% set down = v | select('lt', c) | list %}
-    {{ down[-1] if down | length > 0 else c }}
+  next_down_multi: >
+    {% set overshoot = grid_power - block_limit_w %}
+    {% set shed = (overshoot / watts_per_amp) | round(0, 'ceil') | int %}
+    {% set target = current_amp - shed %}
+    {% set candidates = valid_amps | select('le', target) | list %}
+    {% if candidates | length > 0 %}
+      {{ candidates[-1] }}
+    {% elif valid_amps | length > 0 %}
+      {{ valid_amps[0] }}
+    {% else %}
+      {{ current_amp }}
+    {% endif %}
 
-  should_decrease: >
-    {{ current_block in [1,2,3,4,5] and grid_power > block_limit_w }}
+  should_decrease: "{{ data_ok and grid_power > block_limit_w }}"
+
+  step_up_w: "{{ ((next_up | int) - current_amp) * watts_per_amp }}"
 
   should_increase: >
-    {{ current_block in [1,2,3,4,5] and grid_power < (block_limit_w - tolerance) }}
+    {{ data_ok
+       and (grid_power + step_up_w) <= (block_limit_w - tolerance) }}
 
   new_amp: >
-    {% if should_decrease %}
-      {{ next_down | int }}
+    {% if valid_amps | length == 0 %}
+      {{ current_amp }}
+    {% elif not data_ok %}
+      {{ valid_amps[0] }}
+    {% elif should_decrease %}
+      {{ next_down_multi | int }}
     {% elif should_increase %}
       {{ next_up | int }}
     {% else %}
@@ -195,7 +223,6 @@ action:
           - condition: template
             value_template: >
               {{ valid_amps | length > 0
-                 and current_block in [1,2,3,4,5]
                  and delta_amp != 0 }}
         sequence:
           - service: number.set_value
